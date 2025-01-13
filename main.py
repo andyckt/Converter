@@ -32,6 +32,7 @@ class DownloadWorker(QThread):
     finished = pyqtSignal()
     progress = pyqtSignal(str, float)
     error = pyqtSignal(str)
+    playlist_info = pyqtSignal(dict)  # New signal for playlist info
 
     def __init__(self, url, output_dir, quality, format_):
         super().__init__()
@@ -46,7 +47,6 @@ class DownloadWorker(QThread):
                 'preferredcodec': self.format,
                 'preferredquality': self.quality,
             }],
-            'progress_hooks': [self.progress_hook],
             'retries': 3,
             'fragment_retries': 3,
             'http_headers': {
@@ -54,20 +54,53 @@ class DownloadWorker(QThread):
             },
             'quiet': False,
             'no_warnings': False,
-            'extract_flat': True,
+            'extract_flat': False,  # Changed to False to get full playlist info
             'skip_download': False,
             'verbose': True,
             'nocheckcertificate': True,
             'prefer_insecure': True,
             'buffersize': 1024 * 16,
             'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),
+            'concurrent_fragment_downloads': 8,  # Speed up downloads
+            'lazy_playlist': True,  # Process playlist entries as they are received
         }
         self.ydl = yt_dlp.YoutubeDL(self.ydl_opts)
 
     def run(self):
         try:
-            self.ydl.download([self.url])
+            # First extract playlist info without downloading
+            with yt_dlp.YoutubeDL({'extract_flat': True, 'quiet': True}) as ydl:
+                info = ydl.extract_info(self.url, download=False)
+                
+            if info.get('_type') == 'playlist':
+                # It's a playlist
+                total_entries = info.get('entries', [])
+                self.progress.emit(f'Found playlist with {len(total_entries)} videos', 0)
+                self.playlist_info.emit(info)
+                
+                # Download each video in the playlist
+                for index, entry in enumerate(total_entries, 1):
+                    try:
+                        video_url = entry.get('url')
+                        if not video_url:
+                            video_url = f"https://www.youtube.com/watch?v={entry.get('id')}"
+                        
+                        self.progress.emit(f'Processing video {index}/{len(total_entries)}', 
+                                         (index - 1) * 100 / len(total_entries))
+                        
+                        self.ydl.download([video_url])
+                        
+                    except Exception as e:
+                        self.error.emit(f'Error downloading video {index}: {str(e)}')
+                        continue
+                
+                self.progress.emit('Playlist download complete', 100)
+            else:
+                # Single video
+                self.ydl.download([self.url])
+            
             self.finished.emit()
+            
         except Exception as e:
             self.error.emit(str(e))
 
@@ -274,6 +307,11 @@ class MainWindow(QMainWindow):
         progress_layout.addWidget(self.status_label)
         progress_layout.addWidget(self.progress_bar)
 
+        # Add playlist info label
+        self.playlist_info_label = QLabel()
+        self.playlist_info_label.hide()
+        progress_layout.addWidget(self.playlist_info_label)
+
         # Add toolbar at the top
         self.main_layout.addLayout(toolbar_layout)
         
@@ -432,12 +470,14 @@ class MainWindow(QMainWindow):
         self.download_btn.setEnabled(False)
         self.status_label.setText("Starting download...")
         self.progress_bar.setValue(0)
+        self.playlist_info_label.hide()
         
         # Create and start download thread
         self.worker = DownloadWorker(url, output_dir, quality, format_)
         self.worker.progress.connect(self.update_progress)
         self.worker.finished.connect(self.download_finished)
         self.worker.error.connect(self.download_error)
+        self.worker.playlist_info.connect(self.show_playlist_info)
         self.worker.start()
 
         # Add to history after successful download
@@ -466,6 +506,12 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Error: {error_message}")
         self.progress_bar.setValue(0)
         self.download_btn.setEnabled(True)
+
+    def show_playlist_info(self, info):
+        playlist_title = info.get('title', 'Playlist')
+        video_count = len(info.get('entries', []))
+        self.playlist_info_label.setText(f"Playlist: {playlist_title} ({video_count} videos)")
+        self.playlist_info_label.show()
 
     def setup_tabs(self):
         tab_widget = QTabWidget()
