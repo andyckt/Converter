@@ -4,12 +4,14 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget,
                             QVBoxLayout, QHBoxLayout, QLineEdit, 
                             QPushButton, QLabel, QProgressBar,
                             QFileDialog, QComboBox, QGroupBox,
-                            QListWidget, QTabWidget)
+                            QListWidget, QTabWidget, QDialog,
+                            QDialogButtonBox, QListWidgetItem, QCheckBox)
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QSettings
 from PyQt6.QtGui import QKeySequence, QShortcut, QPalette, QColor
 import yt_dlp
 from datetime import datetime
 import json
+import time
 
 # Define quality presets
 QUALITY_PRESETS = {
@@ -28,18 +30,81 @@ FORMAT_PRESETS = {
     'OPUS': 'opus',
 }
 
+class PlaylistSelectionDialog(QDialog):
+    def __init__(self, playlist_info, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Songs")
+        self.setMinimumWidth(400)
+        
+        layout = QVBoxLayout(self)
+        
+        # Add select all/none buttons
+        button_layout = QHBoxLayout()
+        select_all_btn = QPushButton("Select All")
+        select_none_btn = QPushButton("Select None")
+        select_all_btn.clicked.connect(lambda: self.select_all(True))
+        select_none_btn.clicked.connect(lambda: self.select_all(False))
+        button_layout.addWidget(select_all_btn)
+        button_layout.addWidget(select_none_btn)
+        layout.addLayout(button_layout)
+        
+        # Create list widget with checkboxes
+        self.list_widget = QListWidget()
+        entries = playlist_info.get('entries', [])
+        for i, entry in enumerate(entries, 1):
+            item = QListWidgetItem(f"{i}. {entry.get('title', 'Unknown Title')}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            self.list_widget.addItem(item)
+        layout.addWidget(self.list_widget)
+
+        # Add create folder checkbox
+        self.create_folder_cb = QCheckBox("Create playlist folder")
+        self.create_folder_cb.setChecked(True)  # Default to checked
+        layout.addWidget(self.create_folder_cb)
+        
+        # Add OK/Cancel buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | 
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def select_all(self, checked):
+        for i in range(self.list_widget.count()):
+            self.list_widget.item(i).setCheckState(
+                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+            )
+
+    def get_selected_indices(self):
+        selected = []
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                selected.append(i)
+        return selected
+
+    def should_create_folder(self):
+        return self.create_folder_cb.isChecked()
+
 class DownloadWorker(QThread):
     finished = pyqtSignal()
     progress = pyqtSignal(str, float)
     error = pyqtSignal(str)
-    playlist_info = pyqtSignal(dict)  # New signal for playlist info
+    playlist_info = pyqtSignal(dict)
+    retry_signal = pyqtSignal(str, int)
 
-    def __init__(self, url, output_dir, quality, format_):
+    def __init__(self, url, output_dir, quality, format_, selected_indices=None):
         super().__init__()
         self.url = url
         self.output_dir = output_dir
         self.quality = quality
         self.format = format_
+        self.selected_indices = selected_indices
+        self.max_retries = 3
+        self.retry_delay = 5
         self.ydl_opts = {
             'format': 'bestaudio/best',
             'postprocessors': [{
@@ -54,52 +119,50 @@ class DownloadWorker(QThread):
             },
             'quiet': False,
             'no_warnings': False,
-            'extract_flat': False,  # Changed to False to get full playlist info
+            'extract_flat': False,
             'skip_download': False,
             'verbose': True,
             'nocheckcertificate': True,
             'prefer_insecure': True,
             'buffersize': 1024 * 16,
             'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),
-            'concurrent_fragment_downloads': 8,  # Speed up downloads
-            'lazy_playlist': True,  # Process playlist entries as they are received
+            'concurrent_fragment_downloads': 8,
+            'lazy_playlist': True,
         }
         self.ydl = yt_dlp.YoutubeDL(self.ydl_opts)
 
+    def download_with_retry(self, video_url, index, total):
+        for attempt in range(self.max_retries):
+            try:
+                self.progress.emit(
+                    f'Processing video {index}/{total} (Attempt {attempt + 1}/{self.max_retries})', 
+                    (index - 1) * 100 / total
+                )
+                self.ydl.download([video_url])
+                return True
+            except Exception as e:
+                if attempt < self.max_retries - 1:
+                    self.retry_signal.emit(str(e), self.retry_delay)
+                    time.sleep(self.retry_delay)
+                else:
+                    self.error.emit(f'Failed to download video {index} after {self.max_retries} attempts: {str(e)}')
+                    return False
+
     def run(self):
         try:
-            # First extract playlist info without downloading
+            # First check if it's a playlist without downloading
             with yt_dlp.YoutubeDL({'extract_flat': True, 'quiet': True}) as ydl:
                 info = ydl.extract_info(self.url, download=False)
                 
             if info.get('_type') == 'playlist':
-                # It's a playlist
-                total_entries = info.get('entries', [])
-                self.progress.emit(f'Found playlist with {len(total_entries)} videos', 0)
+                # For playlists, emit info and wait for selection
                 self.playlist_info.emit(info)
-                
-                # Download each video in the playlist
-                for index, entry in enumerate(total_entries, 1):
-                    try:
-                        video_url = entry.get('url')
-                        if not video_url:
-                            video_url = f"https://www.youtube.com/watch?v={entry.get('id')}"
-                        
-                        self.progress.emit(f'Processing video {index}/{len(total_entries)}', 
-                                         (index - 1) * 100 / len(total_entries))
-                        
-                        self.ydl.download([video_url])
-                        
-                    except Exception as e:
-                        self.error.emit(f'Error downloading video {index}: {str(e)}')
-                        continue
-                
-                self.progress.emit('Playlist download complete', 100)
+                # Exit the thread and wait for user selection
+                return
             else:
-                # Single video
-                self.ydl.download([self.url])
-            
-            self.finished.emit()
+                # For single videos, proceed with download immediately
+                self.download_with_retry(self.url, 1, 1)
+                self.finished.emit()
             
         except Exception as e:
             self.error.emit(str(e))
@@ -117,6 +180,74 @@ class DownloadWorker(QThread):
             self.progress.emit(f'Download complete. Converting to {self.format.upper()}...', 100)
         elif d['status'] == 'error':
             self.progress.emit('Error occurred, retrying...', 0)
+
+class PlaylistDownloadWorker(DownloadWorker):
+    def __init__(self, url, output_dir, quality, format_, selected_indices, playlist_title):
+        super().__init__(url, output_dir, quality, format_, selected_indices)
+        
+        if playlist_title:  # Only create folder if playlist_title is provided
+            # Create playlist folder
+            self.playlist_title = self.sanitize_filename(playlist_title)
+            self.playlist_dir = os.path.join(output_dir, self.playlist_title)
+            os.makedirs(self.playlist_dir, exist_ok=True)
+            # Update output template to use playlist directory
+            self.ydl_opts['outtmpl'] = os.path.join(self.playlist_dir, '%(title)s.%(ext)s')
+        else:
+            # Use the original output directory
+            self.ydl_opts['outtmpl'] = os.path.join(output_dir, '%(title)s.%(ext)s')
+            
+        # Create new YoutubeDL instance with updated options
+        self.ydl = yt_dlp.YoutubeDL(self.ydl_opts)
+
+    @staticmethod
+    def sanitize_filename(filename):
+        # Remove or replace invalid characters
+        invalid_chars = '<>:"/\\|?*'
+        for char in invalid_chars:
+            filename = filename.replace(char, '_')
+        # Remove leading/trailing spaces and dots
+        filename = filename.strip('. ')
+        return filename
+
+    def run(self):
+        try:
+            with yt_dlp.YoutubeDL({'extract_flat': True, 'quiet': True}) as ydl:
+                info = ydl.extract_info(self.url, download=False)
+            
+            if not info.get('entries'):
+                self.error.emit("No entries found in playlist")
+                return
+
+            entries = info.get('entries', [])
+            # Filter selected entries
+            if self.selected_indices is not None:
+                selected_entries = [entries[i] for i in self.selected_indices]
+            else:
+                selected_entries = entries
+
+            successful_downloads = 0
+            for index, entry in enumerate(selected_entries, 1):
+                # Get video ID and construct URL
+                video_id = entry.get('id')
+                if not video_id:
+                    continue
+                    
+                video_url = f"https://www.youtube.com/watch?v={video_id}"
+                
+                if self.download_with_retry(video_url, index, len(selected_entries)):
+                    successful_downloads += 1
+
+            if successful_downloads == len(selected_entries):
+                self.progress.emit('Playlist download complete', 100)
+            else:
+                self.progress.emit(
+                    f'Playlist download completed with {len(selected_entries) - successful_downloads} errors', 
+                    100
+                )
+            self.finished.emit()
+
+        except Exception as e:
+            self.error.emit(str(e))
 
 class DownloadHistoryWidget(QWidget):
     def __init__(self, parent=None):
@@ -198,6 +329,8 @@ class MainWindow(QMainWindow):
         
         # Setup tabs last
         self.setup_tabs()
+
+        self.selected_indices = None
 
     def setup_ui(self):
         # Create the main converter widget and its layout
@@ -452,36 +585,28 @@ class MainWindow(QMainWindow):
         url = self.url_input.text().strip()
         output_dir = self.dir_input.text().strip()
         
-        # Get selected format and quality
+        if not url or not output_dir or not os.path.isdir(output_dir):
+            self.status_label.setText("Please enter a valid URL and output directory")
+            return
+
         format_name = self.format_combo.currentText()
         quality_name = self.quality_combo.currentText()
-        
         format_ = FORMAT_PRESETS[format_name]
         quality = QUALITY_PRESETS[quality_name]
-
-        if not url:
-            self.status_label.setText("Please enter a URL")
-            return
-
-        if not output_dir or not os.path.isdir(output_dir):
-            self.status_label.setText("Please select a valid output directory")
-            return
 
         self.download_btn.setEnabled(False)
         self.status_label.setText("Starting download...")
         self.progress_bar.setValue(0)
         self.playlist_info_label.hide()
         
-        # Create and start download thread
+        # Create initial worker to check if it's a playlist
         self.worker = DownloadWorker(url, output_dir, quality, format_)
         self.worker.progress.connect(self.update_progress)
         self.worker.finished.connect(self.download_finished)
         self.worker.error.connect(self.download_error)
-        self.worker.playlist_info.connect(self.show_playlist_info)
+        self.worker.playlist_info.connect(self.show_playlist_selection)
+        self.worker.retry_signal.connect(self.show_retry_message)
         self.worker.start()
-
-        # Add to history after successful download
-        self.history_widget.add_to_history(url, format_, quality)
 
     def update_progress(self, message, percent):
         self.status_label.setText(message)
@@ -507,11 +632,47 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.download_btn.setEnabled(True)
 
-    def show_playlist_info(self, info):
-        playlist_title = info.get('title', 'Playlist')
-        video_count = len(info.get('entries', []))
-        self.playlist_info_label.setText(f"Playlist: {playlist_title} ({video_count} videos)")
-        self.playlist_info_label.show()
+    def show_retry_message(self, error, delay):
+        self.status_label.setText(f"Error: {error}. Retrying in {delay} seconds...")
+
+    def show_playlist_selection(self, info):
+        dialog = PlaylistSelectionDialog(info, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            selected_indices = dialog.get_selected_indices()
+            if not selected_indices:
+                self.status_label.setText("No songs selected")
+                self.download_btn.setEnabled(True)
+                return
+
+            # Get playlist title
+            playlist_title = info.get('title', 'Playlist')
+
+            # Start playlist download with selected songs
+            self.worker = PlaylistDownloadWorker(
+                self.url_input.text().strip(),
+                self.dir_input.text().strip(),
+                QUALITY_PRESETS[self.quality_combo.currentText()],
+                FORMAT_PRESETS[self.format_combo.currentText()],
+                selected_indices,
+                playlist_title if dialog.should_create_folder() else None  # Pass None if folder shouldn't be created
+            )
+            self.worker.progress.connect(self.update_progress)
+            self.worker.finished.connect(self.download_finished)
+            self.worker.error.connect(self.download_error)
+            self.worker.retry_signal.connect(self.show_retry_message)
+            self.worker.start()
+
+            # Update playlist info label
+            selected_count = len(selected_indices)
+            total_count = len(info.get('entries', []))
+            self.playlist_info_label.setText(
+                f"Playlist: {playlist_title} ({selected_count}/{total_count} songs selected)"
+            )
+            self.playlist_info_label.show()
+        else:
+            # Cancel the download if user closes the selection dialog
+            self.download_btn.setEnabled(True)
+            self.status_label.setText("Download cancelled")
 
     def setup_tabs(self):
         tab_widget = QTabWidget()
